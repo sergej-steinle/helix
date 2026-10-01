@@ -72,6 +72,16 @@ type TerminalEvent = crossterm::event::Event;
 
 type Terminal = tui::terminal::Terminal<TerminalBackend>;
 
+/// Requests of an embedding host (feature `embed`), handled in the event loop.
+#[cfg(feature = "embed")]
+type HostRequest = crate::embed::HostRequest;
+#[cfg(feature = "embed")]
+type HostRequests = Option<tokio::sync::mpsc::UnboundedReceiver<HostRequest>>;
+#[cfg(not(feature = "embed"))]
+type HostRequest = std::convert::Infallible;
+#[cfg(not(feature = "embed"))]
+type HostRequests = ();
+
 pub struct Application {
     compositor: Compositor,
     terminal: Terminal,
@@ -84,6 +94,7 @@ pub struct Application {
     lsp_progress: LspProgressMap,
 
     theme_mode: Option<theme::Mode>,
+    host_requests: HostRequests,
 }
 
 #[cfg(feature = "integration")]
@@ -262,9 +273,34 @@ impl Application {
             jobs,
             lsp_progress: LspProgressMap::new(),
             theme_mode,
+            #[cfg(feature = "embed")]
+            host_requests: crate::embed::take_requests(),
+            #[cfg(not(feature = "embed"))]
+            host_requests: (),
         };
 
         Ok(app)
+    }
+
+    /// The next host request; pending forever without a host.
+    async fn next_host_request(_requests: &mut HostRequests) -> Option<HostRequest> {
+        #[cfg(feature = "embed")]
+        return crate::embed::next_request(_requests).await;
+        #[cfg(not(feature = "embed"))]
+        std::future::pending().await
+    }
+
+    async fn handle_host_request(&mut self, request: HostRequest) {
+        #[cfg(feature = "embed")]
+        {
+            let (editor, jobs) = (&mut self.editor, &mut self.jobs);
+            crate::embed::handle(request, editor, &mut self.compositor, jobs);
+            if !self.editor.should_close() {
+                self.render().await;
+            }
+        }
+        #[cfg(not(feature = "embed"))]
+        match request {}
     }
 
     async fn render(&mut self) {
@@ -336,6 +372,9 @@ impl Application {
                 }
                 Some(event) = input_stream.next() => {
                     self.handle_terminal_events(event).await;
+                }
+                Some(request) = Self::next_host_request(&mut self.host_requests) => {
+                    self.handle_host_request(request).await;
                 }
                 Some(callback) = self.jobs.callbacks.recv() => {
                     if let Some(job) = self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback))) {

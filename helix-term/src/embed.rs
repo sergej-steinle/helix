@@ -1,15 +1,21 @@
 //! Embedding Helix in a host application (feature `embed`): after every
 //! frame the host gets the overlays it draws itself, as data. Overlays the
 //! host draws are left out of the cell frames; Helix keeps handling their
-//! keys.
+//! keys. The host runs commands in Helix's event loop ([`HostRequest`]),
+//! and Helix asks the host for its own UI ([`HostAction`]).
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use helix_core::command_line::Args;
 use helix_core::Position;
 use helix_view::{graphics::Rect, Editor};
+use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::compositor::{Component, Compositor};
+use crate::commands::MappableCommand;
+use crate::compositor::{self, Component, Compositor, Event};
+use crate::job::Jobs;
 use crate::ui::lsp::{hover::Hover, signature_help::SignatureHelp};
+use crate::ui::PromptEvent;
 use crate::ui::{picker, EditorView, Markdown, Popup, Prompt};
 
 /// A prompt layer: the command line (`:`), search (`/`), and the like.
@@ -124,19 +130,133 @@ pub struct Overlays {
     pub picker: Option<PickerState>,
 }
 
-type Hook = Box<dyn Fn(Overlays) + Send + Sync>;
+/// What the host asks of Helix; handled in Helix's event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequest {
+    /// A command as keymaps name it: a static command (`file_picker`) or a
+    /// typable one with its arguments (`:write`, `:open a.rs`).
+    Command(String),
+}
 
-static HOOK: OnceLock<Hook> = OnceLock::new();
+/// What Helix asks of the host: the typable commands of [`HOST_COMMANDS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAction {
+    /// `:strukta-leader`: the host's leader.
+    Leader,
+    /// `:strukta-command-line`: the host's command line.
+    CommandLine,
+}
 
-/// Installs the host's hook; from then on the host draws the overlays. Only
-/// the first call counts.
-pub fn install(hook: Hook) {
-    let _ = HOOK.set(hook);
+/// The typable commands that only call the host (registered with `embed`).
+pub const HOST_COMMANDS: [&str; 2] = ["strukta-leader", "strukta-command-line"];
+
+/// The host side of the embedding.
+pub trait Host: Send + Sync {
+    /// The overlays of a frame.
+    fn overlays(&self, overlays: Overlays);
+    /// A [`HostAction`] Helix asks for.
+    fn action(&self, action: HostAction);
+}
+
+static HOST: OnceLock<Box<dyn Host>> = OnceLock::new();
+static REQUESTS: Mutex<Option<UnboundedReceiver<HostRequest>>> = Mutex::new(None);
+
+/// Installs the host before `Application::new`: from then on the host draws
+/// the overlays and Helix handles `requests`. Only the first call counts.
+pub fn install(host: Box<dyn Host>, requests: UnboundedReceiver<HostRequest>) {
+    if HOST.set(host).is_ok() {
+        *REQUESTS.lock().unwrap() = Some(requests);
+    }
 }
 
 /// Whether a host draws the overlays.
 pub fn installed() -> bool {
-    HOOK.get().is_some()
+    HOST.get().is_some()
+}
+
+/// The host's requests, for the application's event loop.
+pub(crate) fn take_requests() -> Option<UnboundedReceiver<HostRequest>> {
+    REQUESTS.lock().unwrap().take()
+}
+
+/// The next host request; pending forever without a host.
+pub(crate) async fn next_request(
+    requests: &mut Option<UnboundedReceiver<HostRequest>>,
+) -> Option<HostRequest> {
+    match requests {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Handles a host request: a command runs like a key mapped to it, after
+/// the prompts, pickers and popups above the editor are closed. Errors go
+/// to the status line.
+pub(crate) fn handle(
+    request: HostRequest,
+    editor: &mut Editor,
+    compositor: &mut Compositor,
+    jobs: &mut Jobs,
+) {
+    let HostRequest::Command(name) = request;
+    let command = match name.parse::<MappableCommand>() {
+        Ok(MappableCommand::Macro { .. }) => {
+            editor.set_error(format!("No command named '{name}'"));
+            return;
+        }
+        Ok(command) => command,
+        Err(err) => {
+            editor.set_error(err.to_string());
+            return;
+        }
+    };
+    let mut cx = compositor::Context {
+        editor,
+        jobs,
+        scroll: None,
+    };
+    // `Esc` to each layer above the editor.
+    while compositor.layers_mut().len() > 1 {
+        let layers = compositor.layers_mut().len();
+        compositor.handle_event(&Event::Key(crate::key!(Esc)), &mut cx);
+        if compositor.layers_mut().len() >= layers {
+            break;
+        }
+    }
+    let Some(view) = compositor.find::<crate::ui::EditorView>() else {
+        return;
+    };
+    if let Some(callback) = view.execute_host_command(&command, &mut cx) {
+        callback(compositor, &mut cx);
+    }
+}
+
+fn ask_host(action: HostAction, event: PromptEvent) -> anyhow::Result<()> {
+    if event == PromptEvent::Validate {
+        let host = HOST
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("no host to ask"))?;
+        host.action(action);
+    }
+    Ok(())
+}
+
+/// `:strukta-leader`.
+pub(crate) fn leader(
+    _: &mut compositor::Context,
+    _: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    ask_host(HostAction::Leader, event)
+}
+
+/// `:strukta-command-line`.
+pub(crate) fn command_line(
+    _: &mut compositor::Context,
+    _: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    ask_host(HostAction::CommandLine, event)
 }
 
 /// Whether the host draws this compositor layer.
@@ -152,7 +272,7 @@ pub fn host_draws(layer: &dyn Component) -> bool {
 
 /// Hands the frame's overlays to the host.
 pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
-    let Some(hook) = HOOK.get() else { return };
+    let Some(host) = HOST.get() else { return };
     let viewport = compositor.size();
     let mut overlays = Overlays {
         info: editor
@@ -200,7 +320,7 @@ pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
             });
         }
     }
-    hook(overlays);
+    host.overlays(overlays);
 }
 
 /// Where a popup points, placed like `Popup::render` does: it stays in place

@@ -4108,7 +4108,25 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         fun: exclude_workspace,
         completer: CommandCompleter::none(),
         signature: Signature { positionals: (0, None), ..Signature::DEFAULT },
-    }
+    },
+    #[cfg(feature = "embed")]
+    TypableCommand {
+        name: crate::embed::HOST_COMMANDS[0],
+        aliases: &[],
+        doc: "Open the embedding host's leader.",
+        fun: crate::embed::leader,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
+    #[cfg(feature = "embed")]
+    TypableCommand {
+        name: crate::embed::HOST_COMMANDS[1],
+        aliases: &[],
+        doc: "Open the embedding host's command line.",
+        fun: crate::embed::command_line,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
 ];
 
 pub static TYPABLE_COMMAND_MAP: LazyLock<HashMap<&'static str, &'static TypableCommand>> =

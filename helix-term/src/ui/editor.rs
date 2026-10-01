@@ -1097,6 +1097,66 @@ impl EditorView {
         }
     }
 
+    /// Runs `command` for an embedding host (feature `embed`) as if a key
+    /// mapped to it was pressed: pending keys are cancelled, and the count
+    /// and register typed so far apply. Returns the compositor callbacks.
+    #[cfg(feature = "embed")]
+    pub fn execute_host_command(
+        &mut self,
+        command: &commands::MappableCommand,
+        context: &mut Context,
+    ) -> Option<crate::compositor::Callback> {
+        let mode = context.editor.mode();
+        if !self.keymaps.pending().is_empty() {
+            self.keymaps.get(mode, key!(Esc));
+        }
+        self.pseudo_pending.clear();
+        context.editor.autoinfo = None;
+        context.editor.status_msg = None;
+        let mut cx = commands::Context {
+            count: context.editor.count.take(),
+            register: context.editor.selected_register.take(),
+            editor: context.editor,
+            callback: Vec::new(),
+            on_next_key_callback: None,
+            jobs: context.jobs,
+        };
+        command.execute(&mut cx);
+        helix_event::dispatch(PostCommand {
+            command,
+            cx: &mut cx,
+        });
+        let new_mode = cx.editor.mode();
+        if new_mode != mode {
+            helix_event::dispatch(OnModeSwitch {
+                old_mode: mode,
+                new_mode,
+                cx: &mut cx,
+            });
+            if new_mode == Mode::Insert {
+                self.last_insert = (command.clone(), Vec::new());
+            }
+        }
+        self.on_next_key = cx.on_next_key_callback.take();
+        let callbacks = take(&mut cx.callback);
+        if cx.editor.should_close() {
+            return None;
+        }
+        let scrolloff = cx.editor.config().scrolloff;
+        let (view, doc) = current!(cx.editor);
+        view.ensure_cursor_in_view(doc, scrolloff);
+        if new_mode != Mode::Insert {
+            doc.append_changes_to_history(view);
+        }
+        (!callbacks.is_empty()).then(|| -> crate::compositor::Callback {
+            Box::new(move |compositor, cx| {
+                for callback in callbacks {
+                    callback(compositor, cx)
+                }
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_completion(
         &mut self,
