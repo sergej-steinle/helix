@@ -44,21 +44,26 @@ use {signal_hook::consts::signal, signal_hook_tokio::Signals};
 #[cfg(windows)]
 type Signals = futures_util::stream::Empty<()>;
 
-#[cfg(all(not(windows), not(feature = "integration")))]
+#[cfg(all(not(windows), not(feature = "integration"), not(feature = "embed")))]
 use tui::backend::TerminaBackend;
 
-#[cfg(all(windows, not(feature = "integration")))]
+#[cfg(all(windows, not(feature = "integration"), not(feature = "embed")))]
 use tui::backend::CrosstermBackend;
+
+#[cfg(feature = "embed")]
+use tui::backend::EmbedBackend;
 
 #[cfg(feature = "integration")]
 use tui::backend::TestBackend;
 
-#[cfg(all(not(windows), not(feature = "integration")))]
+#[cfg(all(not(windows), not(feature = "integration"), not(feature = "embed")))]
 type TerminalBackend = TerminaBackend;
-#[cfg(all(windows, not(feature = "integration")))]
+#[cfg(all(windows, not(feature = "integration"), not(feature = "embed")))]
 type TerminalBackend = CrosstermBackend<std::io::Stdout>;
-#[cfg(feature = "integration")]
+#[cfg(all(feature = "integration", not(feature = "embed")))]
 type TerminalBackend = TestBackend;
+#[cfg(feature = "embed")]
+type TerminalBackend = EmbedBackend;
 
 #[cfg(not(windows))]
 type TerminalEvent = termina::Event;
@@ -106,14 +111,17 @@ impl Application {
         theme_parent_dirs.extend(helix_loader::runtime_dirs().iter().cloned());
         let theme_loader = theme::Loader::new(&theme_parent_dirs);
 
-        #[cfg(all(not(windows), not(feature = "integration")))]
+        #[cfg(all(not(windows), not(feature = "integration"), not(feature = "embed")))]
         let backend = TerminaBackend::new((&config.editor).into())
             .context("failed to create terminal backend")?;
-        #[cfg(all(windows, not(feature = "integration")))]
+        #[cfg(all(windows, not(feature = "integration"), not(feature = "embed")))]
         let backend = CrosstermBackend::new(std::io::stdout(), (&config.editor).into());
 
-        #[cfg(feature = "integration")]
+        #[cfg(all(feature = "integration", not(feature = "embed")))]
         let backend = TestBackend::new(120, 150);
+
+        #[cfg(feature = "embed")]
+        let backend = EmbedBackend::new();
 
         let theme_mode = backend.get_theme_mode();
         let mut terminal = Terminal::new(backend)?;
@@ -224,7 +232,8 @@ impl Application {
             } else {
                 editor.new_file(Action::VerticalSplit);
             }
-        } else if stdin().is_terminal() || cfg!(feature = "integration") {
+        } else if stdin().is_terminal() || cfg!(feature = "integration") || cfg!(feature = "embed")
+        {
             editor.new_file(Action::VerticalSplit);
         } else {
             editor
@@ -283,6 +292,8 @@ impl Application {
         let surface = self.terminal.current_buffer_mut();
 
         self.compositor.render(area, surface, &mut cx);
+        #[cfg(feature = "embed")]
+        crate::embed::report(&self.compositor);
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
         // reset cursor cache
         self.editor.cursor_cache.reset();
@@ -1279,7 +1290,7 @@ impl Application {
         self.terminal.restore()
     }
 
-    #[cfg(all(not(feature = "integration"), not(windows)))]
+    #[cfg(all(not(feature = "integration"), not(feature = "embed"), not(windows)))]
     pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminalEvent>> + Unpin {
         use termina::{escape::csi, Terminal as _};
         let reader = self.terminal.backend().terminal().event_reader();
@@ -1293,12 +1304,12 @@ impl Application {
         })
     }
 
-    #[cfg(all(not(feature = "integration"), windows))]
+    #[cfg(all(not(feature = "integration"), not(feature = "embed"), windows))]
     pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminalEvent>> + Unpin {
         crossterm::event::EventStream::new()
     }
 
-    #[cfg(feature = "integration")]
+    #[cfg(any(feature = "integration", feature = "embed"))]
     pub fn event_stream(&self) -> impl Stream<Item = std::io::Result<TerminalEvent>> + Unpin {
         use std::{
             pin::Pin,

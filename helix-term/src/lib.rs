@@ -6,6 +6,8 @@ pub mod args;
 pub mod commands;
 pub mod compositor;
 pub mod config;
+#[cfg(feature = "embed")]
+pub mod embed;
 pub mod events;
 pub mod health;
 pub mod job;

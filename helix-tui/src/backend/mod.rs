@@ -22,6 +22,9 @@ pub use self::crossterm::CrosstermBackend;
 mod test;
 pub use self::test::TestBackend;
 
+pub mod embed;
+pub use self::embed::EmbedBackend;
+
 /// Representation of a terminal backend.
 pub trait Backend {
     /// Claims the terminal for TUI use.

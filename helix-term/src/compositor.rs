@@ -183,12 +183,26 @@ impl Compositor {
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         for layer in &mut self.layers {
+            #[cfg(feature = "embed")]
+            if crate::embed::host_draws(layer.as_ref()) {
+                continue;
+            }
             layer.render(area, surface, cx);
         }
     }
 
+    /// The layers, bottom first.
+    #[cfg(feature = "embed")]
+    pub fn layers(&self) -> &[Box<dyn Component>] {
+        &self.layers
+    }
+
     pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
         for layer in self.layers.iter().rev() {
+            #[cfg(feature = "embed")]
+            if crate::embed::host_draws(layer.as_ref()) {
+                return (None, CursorKind::Hidden);
+            }
             if let (Some(pos), kind) = layer.cursor(area, editor) {
                 return (Some(pos), kind);
             }

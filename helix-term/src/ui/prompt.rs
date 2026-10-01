@@ -133,6 +133,22 @@ impl Prompt {
         self
     }
 
+    /// The prompt as the embedding host draws it (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn embed_state(&self) -> crate::embed::PromptState {
+        crate::embed::PromptState {
+            prefix: self.prompt.to_string(),
+            line: self.line.clone(),
+            cursor: self.cursor,
+            completions: self
+                .completion
+                .iter()
+                .map(|(_, span)| span.content.to_string())
+                .collect(),
+            selection: self.selection,
+        }
+    }
+
     pub fn line(&self) -> &String {
         &self.line
     }
