@@ -62,6 +62,23 @@ impl SignatureHelp {
         compositor.find_id::<Popup<Self>>(Self::ID)
     }
 
+    /// The shown signature as an embedding host draws it (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn embed_state(&self, anchor: helix_core::Position) -> crate::embed::SignatureState {
+        let index = self
+            .active_signature
+            .min(self.signatures.len().saturating_sub(1));
+        let signature = self.signatures.get(index);
+        crate::embed::SignatureState {
+            signature: signature.map(|s| s.signature.clone()).unwrap_or_default(),
+            active_parameter: signature.and_then(|s| s.active_param_range),
+            documentation: signature.and_then(|s| s.signature_doc.clone()),
+            index,
+            count: self.signatures.len(),
+            anchor,
+        }
+    }
+
     fn signature_index(&self) -> String {
         format!("({}/{})", self.active_signature + 1, self.signatures.len())
     }

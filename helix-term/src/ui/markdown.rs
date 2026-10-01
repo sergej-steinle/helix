@@ -169,6 +169,12 @@ impl Markdown {
         }
     }
 
+    /// The markdown source (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+
     pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
         fn push_line<'a>(spans: &mut Vec<Span<'a>>, lines: &mut Vec<Spans<'a>>) {
             let spans = std::mem::take(spans);

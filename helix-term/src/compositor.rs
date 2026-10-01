@@ -73,6 +73,12 @@ pub trait Component: Any + AnyComponent {
     fn id(&self) -> Option<&'static str> {
         None
     }
+
+    /// The picker's state for an embedding host, if this is a picker.
+    #[cfg(feature = "embed")]
+    fn embed_picker(&mut self, _editor: &Editor) -> Option<crate::embed::PickerState> {
+        None
+    }
 }
 
 pub struct Compositor {
@@ -193,15 +199,19 @@ impl Compositor {
 
     /// The layers, bottom first.
     #[cfg(feature = "embed")]
-    pub fn layers(&self) -> &[Box<dyn Component>] {
-        &self.layers
+    pub fn layers_mut(&mut self) -> &mut [Box<dyn Component>] {
+        &mut self.layers
     }
 
     pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
         for layer in self.layers.iter().rev() {
             #[cfg(feature = "embed")]
             if crate::embed::host_draws(layer.as_ref()) {
-                return (None, CursorKind::Hidden);
+                // The host draws the cursor of layers that have one.
+                match layer.cursor(area, editor).0 {
+                    Some(_) => return (None, CursorKind::Hidden),
+                    None => continue,
+                }
             }
             if let (Some(pos), kind) = layer.cursor(area, editor) {
                 return (Some(pos), kind);

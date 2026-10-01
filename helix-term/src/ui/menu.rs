@@ -213,6 +213,14 @@ impl<T: Item> Menu<T> {
         self.matches.is_empty()
     }
 
+    /// The matching options, best first, and the index of the selected one
+    /// among them (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn embed_matches(&self) -> (Vec<&T>, Option<usize>) {
+        let options = self.matches.iter().map(|&(i, _)| &self.options[i as usize]);
+        (options.collect(), self.cursor)
+    }
+
     pub fn len(&self) -> usize {
         self.matches.len()
     }

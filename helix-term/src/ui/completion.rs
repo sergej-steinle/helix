@@ -455,6 +455,67 @@ impl Completion {
     pub fn area(&mut self, viewport: Rect, editor: &Editor) -> Rect {
         self.popup.area(viewport, editor)
     }
+
+    /// The menu as an embedding host draws it (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn embed_state(
+        &mut self,
+        editor: &mut Editor,
+        viewport: Rect,
+    ) -> crate::embed::CompletionState {
+        const WINDOW: usize = 100;
+        // Places the popup like `render`, which keeps it in place on its row.
+        self.popup.area(viewport, editor);
+        let anchor = self.popup.get_position().unwrap_or_default();
+        if let Some(CompletionItem::Lsp(item)) = self.popup.contents_mut().selection_mut() {
+            self.resolve_handler.ensure_item_resolved(editor, item);
+        }
+        let language = doc!(editor).language_name().unwrap_or("");
+        let (matches, selection) = self.popup.contents().embed_matches();
+        let offset = (selection.unwrap_or(0).saturating_sub(WINDOW / 2))
+            .min(matches.len().saturating_sub(WINDOW));
+        let detail_and_docs = |item: &&CompletionItem| match item {
+            CompletionItem::Lsp(LspCompletionItem { item, .. }) => (
+                item.detail.clone(),
+                item.documentation.as_ref().map(|docs| match docs {
+                    lsp::Documentation::String(text) => text.clone(),
+                    lsp::Documentation::MarkupContent(markup) => markup.value.clone(),
+                }),
+            ),
+            CompletionItem::Other(item) => (None, item.documentation.clone()),
+        };
+        let items = matches.iter().skip(offset).take(WINDOW).map(|item| {
+            let row = menu::Item::format(*item, &Style::default());
+            let text = |i: usize| row.cells.get(i).map(|c| String::from(&c.content));
+            let label_style = row.cells[0].content.lines.first().and_then(|l| l.0.first());
+            crate::embed::CompletionItemState {
+                label: text(0).unwrap_or_default(),
+                kind: text(1).unwrap_or_default(),
+                detail: detail_and_docs(item).0,
+                deprecated: label_style
+                    .is_some_and(|s| s.style.add_modifier.contains(Modifier::CROSSED_OUT)),
+            }
+        });
+        let documentation =
+            selection
+                .and_then(|i| matches.get(i))
+                .and_then(|item| match detail_and_docs(item) {
+                    (Some(detail), Some(docs)) => {
+                        Some(format!("```{language}\n{detail}\n```\n{docs}"))
+                    }
+                    (Some(detail), None) => Some(format!("```{language}\n{detail}\n```")),
+                    (None, docs) => docs,
+                });
+        crate::embed::CompletionState {
+            items: items.collect(),
+            offset,
+            total: matches.len(),
+            selection,
+            filter: self.filter.clone(),
+            documentation,
+            anchor,
+        }
+    }
 }
 
 impl Component for Completion {

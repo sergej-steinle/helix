@@ -680,6 +680,80 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
     }
 
+    /// The picker as an embedding host draws it (feature `embed`): matches
+    /// the query like `render_picker` and formats the page around the cursor.
+    #[cfg(feature = "embed")]
+    fn embed_state(&mut self, editor: &Editor) -> crate::embed::PickerState {
+        const PREVIEW_LINES: usize = 60;
+        let status = self.matcher.tick(10);
+        let snapshot = self.matcher.snapshot();
+        let (matched, total) = (snapshot.matched_item_count(), snapshot.item_count());
+        if status.changed {
+            self.cursor = self.cursor.min(matched.saturating_sub(1));
+        }
+        let page = u32::from(self.completion_height.max(1));
+        let offset = self.cursor - self.cursor % page;
+        let end = offset.saturating_add(page).min(matched);
+        let visible = || self.columns.iter().filter(|column| !column.hidden);
+        let rows = snapshot.matched_items(offset..end).map(|item| {
+            visible()
+                .map(|column| {
+                    column
+                        .format_text(item.data, &self.editor_data)
+                        .into_owned()
+                })
+                .collect()
+        });
+        let columns = match self.columns.len() {
+            1 => Vec::new(),
+            _ => visible().map(|column| column.name.to_string()).collect(),
+        };
+        let mut state = crate::embed::PickerState {
+            prompt: self.prompt.embed_state(),
+            columns,
+            rows: rows.collect(),
+            offset,
+            cursor: (matched > 0).then_some(self.cursor),
+            matched,
+            total,
+            running: status.running || self.matcher.active_injectors() > 0,
+            preview: None,
+        };
+        if !self.show_preview {
+            return state;
+        }
+        let path =
+            self.selection()
+                .and_then(|item| match (self.file_fn.as_ref()?)(editor, item)?.0 {
+                    PathOrId::Path(path) => Some(path.to_path_buf()),
+                    PathOrId::Id(id) => editor.documents.get(&id)?.path().map(|p| p.to_path_buf()),
+                });
+        state.preview = self.get_preview(editor).map(|(preview, range)| {
+            let first_line = range.map_or(0, |(start, _)| start.saturating_sub(PREVIEW_LINES / 4));
+            let (lines, placeholder) = match (preview.document(), preview.dir_content()) {
+                (Some(doc), _) => {
+                    let text = doc.text().slice(..);
+                    let lines = text.lines().skip(first_line).take(PREVIEW_LINES);
+                    let lines = lines.map(|line| line.to_string().trim_end().to_string());
+                    (lines.collect(), None)
+                }
+                (None, Some(entries)) => {
+                    let entries = entries.iter().take(PREVIEW_LINES);
+                    (entries.map(|(name, _)| name.clone()).collect(), None)
+                }
+                (None, None) => (Vec::new(), Some(preview.placeholder().to_string())),
+            };
+            crate::embed::PreviewState {
+                path: path.map(|path| path.display().to_string()),
+                first_line,
+                lines,
+                range,
+                placeholder,
+            }
+        });
+        state
+    }
+
     fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         let status = self.matcher.tick(10);
         let snapshot = self.matcher.snapshot();
@@ -1195,6 +1269,11 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
     fn id(&self) -> Option<&'static str> {
         Some(ID)
+    }
+
+    #[cfg(feature = "embed")]
+    fn embed_picker(&mut self, editor: &Editor) -> Option<crate::embed::PickerState> {
+        Some(self.embed_state(editor))
     }
 }
 impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {

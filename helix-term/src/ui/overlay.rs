@@ -82,4 +82,9 @@ impl<T: Component + 'static> Component for Overlay<T> {
     fn id(&self) -> Option<&'static str> {
         self.content.id()
     }
+
+    #[cfg(feature = "embed")]
+    fn embed_picker(&mut self, editor: &Editor) -> Option<crate::embed::PickerState> {
+        self.content.embed_picker(editor)
+    }
 }

@@ -1646,7 +1646,13 @@ impl Component for EditorView {
             self.render_view(cx.editor, doc, view, area, surface, is_focused);
         }
 
-        if config.auto_info {
+        // An embedding host draws the info box and the completion itself.
+        #[cfg(feature = "embed")]
+        let host_draws = crate::embed::installed();
+        #[cfg(not(feature = "embed"))]
+        let host_draws = false;
+
+        if config.auto_info && !host_draws {
             if let Some(mut info) = cx.editor.autoinfo.take() {
                 info.render(area, surface, cx);
                 cx.editor.autoinfo = Some(info)
@@ -1729,7 +1735,7 @@ impl Component for EditorView {
             }
         }
 
-        if let Some(completion) = self.completion.as_mut() {
+        if let Some(completion) = self.completion.as_mut().filter(|_| !host_draws) {
             completion.render(area, surface, cx);
         }
     }

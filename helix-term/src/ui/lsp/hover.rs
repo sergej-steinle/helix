@@ -58,6 +58,15 @@ impl Hover {
         &self.contents[self.active_index]
     }
 
+    /// The shown hover as markdown, with its header (feature `embed`).
+    #[cfg(feature = "embed")]
+    pub fn embed_markdown(&self) -> String {
+        match self.content() {
+            (Some(header), body) => format!("{}\n\n{}", header.contents(), body.contents()),
+            (None, body) => body.contents().to_string(),
+        }
+    }
+
     fn set_index(&mut self, index: usize) {
         assert!((0..self.contents.len()).contains(&index));
         self.active_index = index;

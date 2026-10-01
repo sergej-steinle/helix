@@ -293,7 +293,7 @@ impl Application {
 
         self.compositor.render(area, surface, &mut cx);
         #[cfg(feature = "embed")]
-        crate::embed::report(&self.compositor);
+        crate::embed::report(&mut self.compositor, cx.editor);
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
         // reset cursor cache
         self.editor.cursor_cache.reset();
