@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use helix_core::command_line::Args;
+use helix_core::doc_formatter::DocumentFormatter;
 use helix_core::Position;
 use helix_view::tree::{HostLayout, HostLayoutEvent};
-use helix_view::{graphics::Rect, Editor, ViewId};
+use helix_view::{graphics::Rect, Editor, View, ViewId};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::commands::MappableCommand;
@@ -175,6 +176,15 @@ pub struct ViewState {
     pub path: Option<PathBuf>,
     /// The primary cursor (zero-based line and column in graphemes).
     pub cursor: Position,
+    /// One entry per row of the view's text area (the view's height minus
+    /// its statusline), top to bottom: the zero-based document line that
+    /// starts on that row, as the gutter draws it. `None` for rows where no
+    /// line starts: soft-wrap continuations, virtual lines (inline
+    /// diagnostics) and rows below the end of the document (the empty line
+    /// after a final newline, where the gutter draws `~`, included). Like the
+    /// gutter, the top row names its line even when that line started above
+    /// it (scrolled into a soft-wrapped line).
+    pub rows: Vec<Option<usize>>,
 }
 
 /// The views of a host layout and what happened to them.
@@ -479,6 +489,7 @@ pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
                         Some(helix_core::coords_at_pos(text, cursor))
                     })
                     .unwrap_or_default(),
+                rows: view_rows(editor, view),
             })
             .collect();
         let message_row = compositor.size().height.saturating_sub(1);
@@ -536,6 +547,54 @@ pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
         }
     }
     host.overlays(overlays);
+}
+
+/// The document line that starts on each row of a view's text area: the
+/// rows `render_document` gives the gutter a line on, computed the same way
+/// (soft wrap and virtual lines included) without drawing.
+fn view_rows(editor: &Editor, view: &View) -> Vec<Option<usize>> {
+    let Some(doc) = editor.document(view.doc) else {
+        return Vec::new();
+    };
+    let inner = view.inner_area(doc);
+    let mut rows = vec![None; inner.height as usize];
+    let theme = &editor.theme;
+    let text = doc.text().slice(..);
+    let offset = doc.view_offset(view.id);
+    let annotations = view.text_annotations(doc, Some(theme));
+    let format = doc.text_format(inner.width, Some(theme));
+    let block_row = helix_core::visual_offset_from_block(
+        text,
+        offset.anchor,
+        offset.anchor,
+        &format,
+        &annotations,
+    )
+    .0
+    .row;
+    // The empty line after a final newline is no line: the gutter draws `~`.
+    let last_line = text.len_lines() - 1;
+    let end = (text.line_to_char(last_line) == text.len_chars()).then_some(last_line);
+    let mut last = (usize::MAX, usize::MAX); // (row, line)
+    let formatter =
+        DocumentFormatter::new_at_prev_checkpoint(text, &format, &annotations, offset.anchor);
+    for grapheme in formatter {
+        let Some(row) = grapheme.visual_pos.row.checked_sub(block_row) else {
+            continue;
+        };
+        if row >= offset.vertical_offset + rows.len() {
+            break;
+        }
+        if row == last.0 {
+            continue;
+        }
+        let first_visual_line = grapheme.line_idx != last.1;
+        last = (row, grapheme.line_idx);
+        if first_visual_line && row >= offset.vertical_offset && Some(grapheme.line_idx) != end {
+            rows[row - offset.vertical_offset] = Some(grapheme.line_idx);
+        }
+    }
+    rows
 }
 
 /// Where a popup points, placed like `Popup::render` does: it stays in place
