@@ -146,8 +146,11 @@ impl<T: Component> Popup<T> {
         };
 
         // -- make sure frame doesn't stick out of bounds
-        let mut rel_x = position.col as u16;
-        let mut rel_y = position.row as u16;
+        // Relative to the viewport, which is not at the origin when it is a
+        // view of an embedding host's layout.
+        let mut rel_x = (position.col as u16).saturating_sub(viewport.x);
+        let mut rel_y = (position.row as u16).saturating_sub(viewport.y);
+        let anchor_row = rel_y;
 
         // if there's a orientation preference, use that
         // if we're on the top part of the screen, do below
@@ -201,13 +204,18 @@ impl<T: Component> Popup<T> {
         let area = match final_pos {
             Open::Above => {
                 rel_y = rel_y.saturating_sub(height);
-                Rect::new(rel_x, rel_y, width, position.row as u16 - rel_y)
+                Rect::new(rel_x, rel_y, width, anchor_row - rel_y)
             }
             Open::Below => {
                 rel_y += 1;
-                let y_max = viewport.bottom().min(height + rel_y);
-                Rect::new(rel_x, rel_y, width, y_max - rel_y)
+                let y_max = viewport.height.min(height + rel_y);
+                Rect::new(rel_x, rel_y, width, y_max.saturating_sub(rel_y))
             }
+        };
+        let area = Rect {
+            x: viewport.x + area.x,
+            y: viewport.y + area.y,
+            ..area
         };
         RenderInfo {
             area,

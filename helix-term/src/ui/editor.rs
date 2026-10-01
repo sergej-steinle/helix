@@ -1719,6 +1719,12 @@ impl Component for EditorView {
             }
         }
 
+        // In an embedding host's layout the message row is as wide as the
+        // focused view: the host shows it below that view's window.
+        let area = match cx.editor.tree.host {
+            Some(_) => area.with_width(view!(cx.editor).area.width.min(area.width)),
+            None => area,
+        };
         let key_width = 15u16; // for showing pending keys
         let mut status_msg_width = 0;
 

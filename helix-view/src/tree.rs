@@ -31,15 +31,27 @@ pub struct HostLayout {
     pub sizes: HashMap<ViewId, (u16, u16)>,
     /// What happened since the host last looked, oldest first.
     pub events: Vec<HostLayoutEvent>,
+    /// Set by the host right before it creates a view itself: its request
+    /// id and the view's size. The next view created takes both.
+    pub opening: Option<(u64, (u16, u16))>,
+    /// The last view removed and its size, for a view that replaces it.
+    last_closed: Option<(ViewId, (u16, u16))>,
+    /// Where the views were on the canvas when the host last looked.
+    places: Vec<(ViewId, Rect)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostLayoutEvent {
-    /// A view was created: split off `from` with `layout`, or the first one.
+    /// A view was created: split off `from` with `layout`, or asked for by
+    /// the host (`request`, see [`HostLayout::opening`]). When Helix
+    /// replaces its last view (closing the only document shown), `from` is
+    /// the view it replaces, and the event comes before that view's
+    /// `Closed`. `from` is `None` only for the first view.
     Opened {
         view: ViewId,
         from: Option<ViewId>,
         layout: Layout,
+        request: Option<u64>,
     },
     Closed {
         view: ViewId,
@@ -155,17 +167,55 @@ impl Tree {
         Some(canvas)
     }
 
-    fn host_opened(&mut self, view: ViewId, from: ViewId, layout: Layout) {
-        let from = self.try_get(from).map(|_| from);
-        let area = (self.area.width, self.area.height);
-        if let Some(host) = &mut self.host {
-            let size = from
-                .and_then(|from| host.sizes.get(&from).copied())
-                .unwrap_or(area);
-            host.sizes.insert(view, size);
-            host.events
-                .push(HostLayoutEvent::Opened { view, from, layout });
+    /// In host layout, whether the views' places on the canvas changed
+    /// since the last call.
+    pub fn host_places_changed(&mut self) -> bool {
+        let places: Vec<(ViewId, Rect)> =
+            self.views().map(|(view, _)| (view.id, view.area)).collect();
+        match &mut self.host {
+            Some(host) if host.places != places => {
+                host.places = places;
+                true
+            }
+            _ => false,
         }
+    }
+
+    fn host_opened(&mut self, view: ViewId, from: ViewId, layout: Layout) {
+        let mut from = self.try_get(from).map(|_| from);
+        let area = (self.area.width, self.area.height);
+        let Some(host) = &mut self.host else { return };
+        let request = host.opening.take();
+        let mut size = request.map(|(_, size)| size);
+        let mut at = host.events.len();
+        if from.is_none() && request.is_none() {
+            // The tree was emptied and Helix put a view back in: it takes
+            // the place of the last view closed.
+            if let Some((closed, closed_size)) = host.last_closed {
+                if let Some(index) = host
+                    .events
+                    .iter()
+                    .position(|event| *event == HostLayoutEvent::Closed { view: closed })
+                {
+                    from = Some(closed);
+                    size = Some(closed_size);
+                    at = index;
+                }
+            }
+        }
+        let size = size
+            .or_else(|| from.and_then(|from| host.sizes.get(&from).copied()))
+            .unwrap_or(area);
+        host.sizes.insert(view, size);
+        host.events.insert(
+            at,
+            HostLayoutEvent::Opened {
+                view,
+                from,
+                layout,
+                request: request.map(|(id, _)| id),
+            },
+        );
     }
 
     pub fn insert(&mut self, view: View) -> ViewId {
@@ -325,7 +375,9 @@ impl Tree {
 
         self.remove_or_replace(index, None);
         if let Some(host) = &mut self.host {
-            host.sizes.remove(&index);
+            if let Some(size) = host.sizes.remove(&index) {
+                host.last_closed = Some((index, size));
+            }
             host.events.push(HostLayoutEvent::Closed { view: index });
         }
 
@@ -1050,5 +1102,181 @@ mod test {
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A tree in host layout with one view of `size`.
+    fn host_tree(size: (u16, u16)) -> (Tree, ViewId) {
+        let mut tree = Tree::new(Rect::new(0, 0, size.0, size.1));
+        tree.host = Some(HostLayout::default());
+        let view = tree.insert(View::new(DocumentId::default(), GutterConfig::default()));
+        (tree, view)
+    }
+
+    fn host_view() -> View {
+        View::new(DocumentId::default(), GutterConfig::default())
+    }
+
+    fn events(tree: &mut Tree) -> Vec<HostLayoutEvent> {
+        std::mem::take(&mut tree.host.as_mut().unwrap().events)
+    }
+
+    fn resize(tree: &mut Tree, view: ViewId, size: (u16, u16)) {
+        tree.host.as_mut().unwrap().sizes.insert(view, size);
+        tree.recalculate();
+    }
+
+    #[test]
+    fn host_layout_stacks_views_at_their_own_sizes() {
+        let (mut tree, first) = host_tree((80, 24));
+        assert_eq!(
+            events(&mut tree),
+            [HostLayoutEvent::Opened {
+                view: first,
+                from: None,
+                layout: Layout::Vertical,
+                request: None,
+            }]
+        );
+        assert_eq!(tree.get(first).area, Rect::new(0, 0, 80, 24));
+
+        let second = tree.split(host_view(), Layout::Vertical);
+        assert_eq!(tree.focus, second);
+        // A split starts at the size of the view it was split from.
+        assert_eq!(tree.get(second).area, Rect::new(0, 24, 80, 24));
+        let third = tree.split(host_view(), Layout::Horizontal);
+        assert_eq!(
+            events(&mut tree),
+            [
+                HostLayoutEvent::Opened {
+                    view: second,
+                    from: Some(first),
+                    layout: Layout::Vertical,
+                    request: None,
+                },
+                HostLayoutEvent::Opened {
+                    view: third,
+                    from: Some(second),
+                    layout: Layout::Horizontal,
+                    request: None,
+                },
+            ]
+        );
+
+        resize(&mut tree, first, (40, 10));
+        resize(&mut tree, second, (100, 5));
+        resize(&mut tree, third, (30, 7));
+        let areas: Vec<Rect> = tree.views().map(|(view, _)| view.area).collect();
+        assert_eq!(
+            areas,
+            [
+                Rect::new(0, 0, 40, 10),
+                Rect::new(0, 10, 100, 5),
+                Rect::new(0, 15, 30, 7),
+            ]
+        );
+        // The widest view by the sum of the heights.
+        assert_eq!(tree.host_canvas(), Some((100, 22)));
+    }
+
+    #[test]
+    fn host_layout_reports_closed_views_and_forgets_their_size() {
+        let (mut tree, first) = host_tree((80, 24));
+        let second = tree.split(host_view(), Layout::Vertical);
+        resize(&mut tree, second, (50, 10));
+        events(&mut tree);
+
+        tree.remove(second);
+        assert_eq!(
+            events(&mut tree),
+            [HostLayoutEvent::Closed { view: second }]
+        );
+        assert_eq!(tree.focus, first);
+        assert!(!tree.host.as_ref().unwrap().sizes.contains_key(&second));
+        assert_eq!(tree.host_canvas(), Some((80, 24)));
+        assert_eq!(tree.get(first).area, Rect::new(0, 0, 80, 24));
+    }
+
+    #[test]
+    fn host_layout_gives_a_view_the_host_asked_for_its_request_and_size() {
+        let (mut tree, first) = host_tree((80, 24));
+        events(&mut tree);
+        tree.host.as_mut().unwrap().opening = Some((7, (60, 12)));
+        let view = tree.split(host_view(), Layout::Vertical);
+        assert_eq!(
+            events(&mut tree),
+            [HostLayoutEvent::Opened {
+                view,
+                from: Some(first),
+                layout: Layout::Vertical,
+                request: Some(7),
+            }]
+        );
+        assert_eq!(tree.get(view).area, Rect::new(0, 24, 60, 12));
+        assert_eq!(tree.host.as_ref().unwrap().opening, None);
+
+        // The next split is Helix's own again.
+        let next = tree.split(host_view(), Layout::Horizontal);
+        assert!(matches!(
+            events(&mut tree)[..],
+            [HostLayoutEvent::Opened { view, request: None, .. }] if view == next
+        ));
+    }
+
+    #[test]
+    fn host_layout_reports_a_replaced_last_view_before_its_close() {
+        let (mut tree, first) = host_tree((80, 24));
+        resize(&mut tree, first, (70, 20));
+        events(&mut tree);
+
+        // Closing the only document shown: Helix removes the last view and
+        // inserts a new one.
+        tree.remove(first);
+        assert!(tree.is_empty());
+        let replacement = tree.insert(host_view());
+        assert_eq!(
+            events(&mut tree),
+            [
+                HostLayoutEvent::Opened {
+                    view: replacement,
+                    from: Some(first),
+                    layout: Layout::Vertical,
+                    request: None,
+                },
+                HostLayoutEvent::Closed { view: first },
+            ]
+        );
+        assert_eq!(tree.get(replacement).area, Rect::new(0, 0, 70, 20));
+    }
+
+    #[test]
+    fn host_layout_tells_when_views_moved_on_the_canvas() {
+        let (mut tree, first) = host_tree((80, 24));
+        assert!(tree.host_places_changed());
+        assert!(!tree.host_places_changed());
+        // The focus does not move anything.
+        let second = tree.split(host_view(), Layout::Vertical);
+        assert!(tree.host_places_changed());
+        tree.focus = first;
+        assert!(!tree.host_places_changed());
+        resize(&mut tree, second, (80, 10));
+        assert!(tree.host_places_changed());
+        // A view replaced by another one of the same size at the same place.
+        tree.remove(second);
+        let third = tree.split(host_view(), Layout::Vertical);
+        resize(&mut tree, third, (80, 10));
+        assert_eq!(tree.get(third).area, Rect::new(0, 24, 80, 10));
+        assert!(tree.host_places_changed());
+    }
+
+    #[test]
+    fn without_host_layout_nothing_is_recorded() {
+        let mut tree = Tree::new(Rect::new(0, 0, 80, 24));
+        let first = tree.insert(host_view());
+        let second = tree.split(host_view(), Layout::Vertical);
+        tree.remove(second);
+        assert!(tree.host.is_none());
+        assert_eq!(tree.host_canvas(), None);
+        assert!(!tree.host_places_changed());
+        assert_eq!(tree.get(first).area, Rect::new(0, 0, 80, 24));
     }
 }

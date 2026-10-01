@@ -78,17 +78,19 @@ impl<T: Item> Component for Select<T> {
         // + 2 for borders and another + 2 for horizontal padding
         let width = message_width + 4;
         let height = message_height + 2 + menu_height;
+        // Centered in `area` and kept inside it (an embedding host's view).
         let area = Rect {
-            x: (area.width / 2) - width / 2,
-            y: (area.height / 2) - height / 2,
+            x: area.x + (area.width / 2).saturating_sub(width / 2),
+            y: area.y + (area.height / 2).saturating_sub(height / 2),
             width,
             height,
-        };
+        }
+        .intersection(area);
 
         // Message
         let background = cx.editor.theme.get("ui.background");
         let text = cx.editor.theme.get("ui.text");
-        let message_box = area.with_height(message_height + 2);
+        let message_box = area.with_height((message_height + 2).min(area.height));
         surface.clear_with(message_box, background.patch(text));
         BLOCK.render(message_box, surface);
         // Add horizontal padding so the message isn't too close to the border.

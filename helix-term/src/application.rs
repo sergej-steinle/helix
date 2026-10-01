@@ -296,7 +296,14 @@ impl Application {
         #[cfg(feature = "embed")]
         {
             let (editor, jobs) = (&mut self.editor, &mut self.jobs);
-            crate::embed::handle(request, editor, &mut self.compositor, jobs);
+            if let Some(event) = crate::embed::handle(request, editor, &mut self.compositor, jobs) {
+                let mut cx = crate::compositor::Context {
+                    editor: &mut self.editor,
+                    jobs: &mut self.jobs,
+                    scroll: None,
+                };
+                self.compositor.handle_event(&event, &mut cx);
+            }
             if !self.editor.should_close() {
                 self.render().await;
             }
@@ -306,6 +313,8 @@ impl Application {
     }
 
     async fn render(&mut self) {
+        #[cfg(feature = "embed")]
+        crate::embed::fit_canvas(&mut self.editor, &mut self.compositor);
         if self.compositor.full_redraw {
             self.terminal.clear().expect("Cannot clear the terminal");
             self.compositor.full_redraw = false;
@@ -320,8 +329,6 @@ impl Application {
         helix_event::start_frame();
         cx.editor.needs_redraw = false;
 
-        #[cfg(feature = "embed")]
-        crate::embed::fit_canvas(cx.editor, &mut self.compositor);
         let area = self
             .terminal
             .autoresize()

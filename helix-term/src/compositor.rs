@@ -193,6 +193,8 @@ impl Compositor {
             if crate::embed::host_draws(layer.as_ref()) {
                 continue;
             }
+            #[cfg(feature = "embed")]
+            let area = crate::embed::layer_area(layer.as_ref(), area, cx.editor);
             layer.render(area, surface, cx);
         }
     }

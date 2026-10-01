@@ -4,6 +4,7 @@
 //! keys. The host runs commands in Helix's event loop ([`HostRequest`]),
 //! and Helix asks the host for its own UI ([`HostAction`]).
 
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use helix_core::command_line::Args;
@@ -137,13 +138,28 @@ pub enum HostRequest {
     /// A command as keymaps name it: a static command (`file_picker`) or a
     /// typable one with its arguments (`:write`, `:open a.rs`).
     Command(String),
-    /// Host layout: focus a view (keys go to the focused view).
+    /// Input (a key, a paste) for a view: the view is focused first, in
+    /// the same queue, so input never lands in the view focused before.
+    /// Input for a view that is gone is dropped.
+    Input(ViewId, Event),
+    /// Host layout: focus a view.
     Focus(ViewId),
     /// Host layout: close a view (its window was closed). The last view
     /// stays: Helix cannot run without one.
     Close(ViewId),
     /// Host layout: a view's size in cells, statusline included.
     Resize(ViewId, u16, u16),
+    /// Host layout: a new view for a window of the host, at its size, on
+    /// `path` (at `line` and `column`) or a new scratch document. It is reported
+    /// as [`HostLayoutEvent::Opened`] with `request`.
+    OpenView {
+        request: u64,
+        path: Option<PathBuf>,
+        /// The cursor's line and column, from 1 (column 1 if not given).
+        line: Option<usize>,
+        column: Option<usize>,
+        size: (u16, u16),
+    },
     /// Draw everything again (a client attached).
     Redraw,
 }
@@ -155,8 +171,10 @@ pub struct ViewState {
     /// Where the view is on the canvas.
     pub area: Rect,
     pub focused: bool,
-    /// The document's display name.
-    pub doc: String,
+    /// The document's path; `None` for a scratch document.
+    pub path: Option<PathBuf>,
+    /// The primary cursor (zero-based line and column in graphemes).
+    pub cursor: Position,
 }
 
 /// The views of a host layout and what happened to them.
@@ -206,8 +224,13 @@ pub(crate) fn setup_editor(editor: &mut Editor) {
 }
 
 /// Grows or shrinks the backend to the canvas the views need, plus the
-/// message row.
-pub(crate) fn fit_canvas(editor: &Editor, compositor: &mut Compositor) {
+/// message row. When the views moved on the canvas, everything is drawn
+/// again: the host cuts each view's surface from its place, and a diff
+/// against what another view showed there would be wrong.
+pub(crate) fn fit_canvas(editor: &mut Editor, compositor: &mut Compositor) {
+    if editor.tree.host_places_changed() {
+        compositor.need_full_redraw();
+    }
     if let Some((width, height)) = editor.tree.host_canvas() {
         let canvas = Rect::new(0, 0, width.max(1), height.saturating_add(1));
         tui::backend::embed::set_size(canvas.width, canvas.height);
@@ -250,26 +273,31 @@ pub(crate) async fn next_request(
 
 /// Handles a host request: a command runs like a key mapped to it, after
 /// the prompts, pickers and popups above the editor are closed. Errors go
-/// to the status line.
+/// to the status line. Returns the input for the compositor, if any.
 pub(crate) fn handle(
     request: HostRequest,
     editor: &mut Editor,
     compositor: &mut Compositor,
     jobs: &mut Jobs,
-) {
+) -> Option<Event> {
     let name = match request {
         HostRequest::Command(name) => name,
+        HostRequest::Input(view, event) => {
+            editor.tree.try_get(view)?;
+            editor.focus(view);
+            return Some(event);
+        }
         HostRequest::Focus(view) => {
-            if editor.tree.contains(view) && editor.tree.try_get(view).is_some() {
+            if editor.tree.try_get(view).is_some() {
                 editor.focus(view);
             }
-            return;
+            return None;
         }
         HostRequest::Close(view) => {
             if editor.tree.try_get(view).is_some() && editor.tree.views().count() > 1 {
                 editor.close(view);
             }
-            return;
+            return None;
         }
         HostRequest::Resize(view, width, height) => {
             if editor.tree.try_get(view).is_some() {
@@ -279,22 +307,33 @@ pub(crate) fn handle(
                 editor.tree.recalculate();
                 editor.ensure_cursor_in_view(view);
             }
-            return;
+            return None;
+        }
+        HostRequest::OpenView {
+            request,
+            path,
+            line,
+            column,
+            size: (width, height),
+        } => {
+            let size = (width.max(2), height.max(2));
+            open_view(editor, request, path, (line, column), size);
+            return None;
         }
         HostRequest::Redraw => {
             compositor.need_full_redraw();
-            return;
+            return None;
         }
     };
     let command = match name.parse::<MappableCommand>() {
         Ok(MappableCommand::Macro { .. }) => {
             editor.set_error(format!("No command named '{name}'"));
-            return;
+            return None;
         }
         Ok(command) => command,
         Err(err) => {
             editor.set_error(err.to_string());
-            return;
+            return None;
         }
     };
     let mut cx = compositor::Context {
@@ -310,11 +349,70 @@ pub(crate) fn handle(
             break;
         }
     }
-    let Some(view) = compositor.find::<crate::ui::EditorView>() else {
-        return;
-    };
+    let view = compositor.find::<crate::ui::EditorView>()?;
     if let Some(callback) = view.execute_host_command(&command, &mut cx) {
         callback(compositor, &mut cx);
+    }
+    None
+}
+
+/// [`HostRequest::OpenView`]: a view split off the focused one, on `path`
+/// or a scratch document if there is none or it cannot be opened.
+fn open_view(
+    editor: &mut Editor,
+    request: u64,
+    path: Option<PathBuf>,
+    (line, column): (Option<usize>, Option<usize>),
+    size: (u16, u16),
+) {
+    use helix_view::editor::Action;
+
+    if let Some(host) = &mut editor.tree.host {
+        host.opening = Some((request, size));
+    }
+    let opened = path.is_some_and(|path| match editor.open(&path, Action::VerticalSplit) {
+        Ok(_) => true,
+        Err(err) => {
+            editor.set_error(format!("cannot open {}: {err}", path.display()));
+            false
+        }
+    });
+    if opened {
+        if let Some(line) = line.filter(|line| *line > 0) {
+            goto(editor, line, column.unwrap_or(1));
+        }
+    } else {
+        editor.new_file(Action::VerticalSplit);
+    }
+    if let Some(host) = &mut editor.tree.host {
+        host.opening = None;
+    }
+}
+
+/// Moves the focused view's cursor to `line` and `column` (from 1, in
+/// graphemes, clamped to the text), centered.
+fn goto(editor: &mut Editor, line: usize, column: usize) {
+    use helix_view::{align_view, Align};
+
+    let (view, doc) = helix_view::current!(editor);
+    let text = doc.text().slice(..);
+    let line = (line - 1).min(text.len_lines().saturating_sub(1));
+    let position = Position::new(line, column.saturating_sub(1));
+    let pos = helix_core::pos_at_coords(text, position, true);
+    doc.set_selection(view.id, helix_core::Selection::point(pos));
+    align_view(doc, view, Align::Center);
+}
+
+/// In host layout, the area of the layers above the editor (popups Helix
+/// still draws: code actions, `Select`, DAP): the focused view's, so they
+/// never spill into another view's window.
+pub(crate) fn layer_area(layer: &dyn Component, area: Rect, editor: &Editor) -> Rect {
+    match &editor.tree.host {
+        Some(_) if !layer.as_any().is::<EditorView>() => editor
+            .tree
+            .try_get(editor.tree.focus)
+            .map_or(area, |view| view.area.intersection(area)),
+        _ => area,
     }
 }
 
@@ -369,9 +467,17 @@ pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
                 id: view.id,
                 area: view.area,
                 focused,
-                doc: editor
+                path: editor
                     .document(view.doc)
-                    .map(|doc| doc.display_name().into_owned())
+                    .and_then(|doc| doc.path().map(|path| path.to_path_buf())),
+                cursor: editor
+                    .document(view.doc)
+                    .and_then(|doc| {
+                        let text = doc.text().slice(..);
+                        let selection = doc.selections().get(&view.id)?;
+                        let cursor = selection.primary().cursor(text);
+                        Some(helix_core::coords_at_pos(text, cursor))
+                    })
                     .unwrap_or_default(),
             })
             .collect();
