@@ -151,6 +151,8 @@ impl Application {
             workspace_trust,
         );
         Self::load_configured_theme(&mut editor, &config.load(), &mut terminal, theme_mode);
+        #[cfg(feature = "embed")]
+        crate::embed::setup_editor(&mut editor);
 
         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
             &config.keys
@@ -318,6 +320,8 @@ impl Application {
         helix_event::start_frame();
         cx.editor.needs_redraw = false;
 
+        #[cfg(feature = "embed")]
+        crate::embed::fit_canvas(cx.editor, &mut self.compositor);
         let area = self
             .terminal
             .autoresize()

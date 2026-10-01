@@ -40,6 +40,14 @@ pub fn install(host: Arc<EmbedHost>) {
     let _ = HOST.set(host);
 }
 
+/// Sets the host's size, e.g. the canvas a host layout needs; the next
+/// render picks it up (and redraws everything if it changed).
+pub fn set_size(width: u16, height: u16) {
+    if let Some(host) = HOST.get() {
+        *host.size.lock().unwrap() = (width, height);
+    }
+}
+
 pub struct EmbedBackend {
     host: Arc<EmbedHost>,
     frame: EmbedFrame,

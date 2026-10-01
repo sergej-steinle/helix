@@ -8,7 +8,8 @@ use std::sync::{Mutex, OnceLock};
 
 use helix_core::command_line::Args;
 use helix_core::Position;
-use helix_view::{graphics::Rect, Editor};
+use helix_view::tree::{HostLayout, HostLayoutEvent};
+use helix_view::{graphics::Rect, Editor, ViewId};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::commands::MappableCommand;
@@ -136,6 +137,35 @@ pub enum HostRequest {
     /// A command as keymaps name it: a static command (`file_picker`) or a
     /// typable one with its arguments (`:write`, `:open a.rs`).
     Command(String),
+    /// Host layout: focus a view (keys go to the focused view).
+    Focus(ViewId),
+    /// Host layout: close a view (its window was closed). The last view
+    /// stays: Helix cannot run without one.
+    Close(ViewId),
+    /// Host layout: a view's size in cells, statusline included.
+    Resize(ViewId, u16, u16),
+    /// Draw everything again (a client attached).
+    Redraw,
+}
+
+/// A view in host layout, as the host sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewState {
+    pub id: ViewId,
+    /// Where the view is on the canvas.
+    pub area: Rect,
+    pub focused: bool,
+    /// The document's display name.
+    pub doc: String,
+}
+
+/// The views of a host layout and what happened to them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutState {
+    pub views: Vec<ViewState>,
+    /// The canvas row with Helix's messages and pending keys.
+    pub message_row: u16,
+    pub events: Vec<HostLayoutEvent>,
 }
 
 /// What Helix asks of the host: the typable commands of [`HOST_COMMANDS`].
@@ -156,6 +186,35 @@ pub trait Host: Send + Sync {
     fn overlays(&self, overlays: Overlays);
     /// A [`HostAction`] Helix asks for.
     fn action(&self, action: HostAction);
+    /// The views of a host layout, before each frame.
+    fn layout(&self, _layout: LayoutState) {}
+}
+
+static HOST_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Before `Application::new`: the host lays out the views (one window per
+/// view) instead of Helix's split tree.
+pub fn set_host_layout(on: bool) {
+    HOST_LAYOUT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Called right after the editor is created, before any view exists.
+pub(crate) fn setup_editor(editor: &mut Editor) {
+    if HOST_LAYOUT.load(std::sync::atomic::Ordering::Relaxed) {
+        editor.tree.host = Some(HostLayout::default());
+    }
+}
+
+/// Grows or shrinks the backend to the canvas the views need, plus the
+/// message row.
+pub(crate) fn fit_canvas(editor: &Editor, compositor: &mut Compositor) {
+    if let Some((width, height)) = editor.tree.host_canvas() {
+        let canvas = Rect::new(0, 0, width.max(1), height.saturating_add(1));
+        tui::backend::embed::set_size(canvas.width, canvas.height);
+        if compositor.size() != canvas {
+            compositor.resize(canvas);
+        }
+    }
 }
 
 static HOST: OnceLock<Box<dyn Host>> = OnceLock::new();
@@ -198,7 +257,35 @@ pub(crate) fn handle(
     compositor: &mut Compositor,
     jobs: &mut Jobs,
 ) {
-    let HostRequest::Command(name) = request;
+    let name = match request {
+        HostRequest::Command(name) => name,
+        HostRequest::Focus(view) => {
+            if editor.tree.contains(view) && editor.tree.try_get(view).is_some() {
+                editor.focus(view);
+            }
+            return;
+        }
+        HostRequest::Close(view) => {
+            if editor.tree.try_get(view).is_some() && editor.tree.views().count() > 1 {
+                editor.close(view);
+            }
+            return;
+        }
+        HostRequest::Resize(view, width, height) => {
+            if editor.tree.try_get(view).is_some() {
+                if let Some(host) = &mut editor.tree.host {
+                    host.sizes.insert(view, (width.max(2), height.max(2)));
+                }
+                editor.tree.recalculate();
+                editor.ensure_cursor_in_view(view);
+            }
+            return;
+        }
+        HostRequest::Redraw => {
+            compositor.need_full_redraw();
+            return;
+        }
+    };
     let command = match name.parse::<MappableCommand>() {
         Ok(MappableCommand::Macro { .. }) => {
             editor.set_error(format!("No command named '{name}'"));
@@ -273,6 +360,28 @@ pub fn host_draws(layer: &dyn Component) -> bool {
 /// Hands the frame's overlays to the host.
 pub(crate) fn report(compositor: &mut Compositor, editor: &mut Editor) {
     let Some(host) = HOST.get() else { return };
+    if let Some(layout) = &mut editor.tree.host {
+        let events = std::mem::take(&mut layout.events);
+        let views: Vec<ViewState> = editor
+            .tree
+            .views()
+            .map(|(view, focused)| ViewState {
+                id: view.id,
+                area: view.area,
+                focused,
+                doc: editor
+                    .document(view.doc)
+                    .map(|doc| doc.display_name().into_owned())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let message_row = compositor.size().height.saturating_sub(1);
+        host.layout(LayoutState {
+            views,
+            message_row,
+            events,
+        });
+    }
     let viewport = compositor.size();
     let mut overlays = Overlays {
         info: editor

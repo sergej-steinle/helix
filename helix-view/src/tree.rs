@@ -1,5 +1,6 @@
 use crate::{graphics::Rect, View, ViewId};
 use slotmap::SlotMap;
+use std::collections::HashMap;
 
 // the dimensions are recomputed on window resize/tree change.
 //
@@ -15,6 +16,40 @@ pub struct Tree {
 
     // used for traversals
     stack: Vec<(ViewId, Rect)>,
+
+    /// Set when an embedding host lays out the views (see [`HostLayout`]).
+    pub host: Option<HostLayout>,
+}
+
+/// An embedding host owns the layout: it sizes each view, and Helix stacks
+/// the views on one canvas (each view at x 0, one below the other) instead
+/// of splitting its area. Splits, closes and focus moves are reported as
+/// [`HostLayoutEvent`]s for the host to apply to its own windows.
+#[derive(Debug, Default)]
+pub struct HostLayout {
+    /// The size of each view, in cells (statusline included).
+    pub sizes: HashMap<ViewId, (u16, u16)>,
+    /// What happened since the host last looked, oldest first.
+    pub events: Vec<HostLayoutEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostLayoutEvent {
+    /// A view was created: split off `from` with `layout`, or the first one.
+    Opened {
+        view: ViewId,
+        from: Option<ViewId>,
+        layout: Layout,
+    },
+    Closed {
+        view: ViewId,
+    },
+    /// Window commands Helix leaves to the host: `C-w w`, `C-w h`, ...
+    FocusNext,
+    FocusPrev,
+    FocusDirection(Direction),
+    Swap(Direction),
+    Transpose,
 }
 
 #[derive(Debug)]
@@ -52,7 +87,7 @@ pub enum Layout {
     // could explore stacked/tabbed
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Up,
     Down,
@@ -100,6 +135,36 @@ impl Tree {
             area,
             nodes,
             stack: Vec::new(),
+            host: None,
+        }
+    }
+
+    /// The canvas the views need in host layout: the widest view by the sum
+    /// of their heights.
+    pub fn host_canvas(&self) -> Option<(u16, u16)> {
+        let host = self.host.as_ref()?;
+        let mut canvas = (0u16, 0u16);
+        for (view, _) in self.views() {
+            let (w, h) = host
+                .sizes
+                .get(&view.id)
+                .copied()
+                .unwrap_or((self.area.width, self.area.height));
+            canvas = (canvas.0.max(w), canvas.1.saturating_add(h));
+        }
+        Some(canvas)
+    }
+
+    fn host_opened(&mut self, view: ViewId, from: ViewId, layout: Layout) {
+        let from = self.try_get(from).map(|_| from);
+        let area = (self.area.width, self.area.height);
+        if let Some(host) = &mut self.host {
+            let size = from
+                .and_then(|from| host.sizes.get(&from).copied())
+                .unwrap_or(area);
+            host.sizes.insert(view, size);
+            host.events
+                .push(HostLayoutEvent::Opened { view, from, layout });
         }
     }
 
@@ -134,6 +199,7 @@ impl Tree {
         container.children.insert(pos, node);
         // focus the new node
         self.focus = node;
+        self.host_opened(node, focus, Layout::Vertical);
 
         // recalculate all the sizes
         self.recalculate();
@@ -207,6 +273,7 @@ impl Tree {
 
         // focus the new node
         self.focus = node;
+        self.host_opened(node, focus, layout);
 
         // recalculate all the sizes
         self.recalculate();
@@ -257,6 +324,10 @@ impl Tree {
         let parent_is_root = parent == self.root;
 
         self.remove_or_replace(index, None);
+        if let Some(host) = &mut self.host {
+            host.sizes.remove(&index);
+            host.events.push(HostLayoutEvent::Closed { view: index });
+        }
 
         let parent_container = self.container_mut(parent);
         if parent_container.children.len() == 1 && !parent_is_root {
@@ -357,6 +428,21 @@ impl Tree {
             // There are no more views, so the tree should focus itself again.
             self.focus = self.root;
 
+            return;
+        }
+
+        if let Some(host) = &mut self.host {
+            let (x, mut y) = (self.area.x, self.area.y);
+            for (key, node) in self.nodes.iter_mut() {
+                if let Content::View(view) = &mut node.content {
+                    let (width, height) = *host
+                        .sizes
+                        .entry(key)
+                        .or_insert((self.area.width, self.area.height));
+                    view.area = Rect::new(x, y, width, height);
+                    y = y.saturating_add(height);
+                }
+            }
             return;
         }
 

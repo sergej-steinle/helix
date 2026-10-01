@@ -2302,15 +2302,33 @@ impl Editor {
         });
     }
 
+    /// In host layout, window commands go to the host instead.
+    fn ask_host_layout(&mut self, event: tree::HostLayoutEvent) -> bool {
+        match &mut self.tree.host {
+            Some(host) => {
+                host.events.push(event);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn focus_next(&mut self) {
-        self.focus(self.tree.next());
+        if !self.ask_host_layout(tree::HostLayoutEvent::FocusNext) {
+            self.focus(self.tree.next());
+        }
     }
 
     pub fn focus_prev(&mut self) {
-        self.focus(self.tree.prev());
+        if !self.ask_host_layout(tree::HostLayoutEvent::FocusPrev) {
+            self.focus(self.tree.prev());
+        }
     }
 
     pub fn focus_direction(&mut self, direction: tree::Direction) {
+        if self.ask_host_layout(tree::HostLayoutEvent::FocusDirection(direction)) {
+            return;
+        }
         let current_view = self.tree.focus;
         if let Some(id) = self.tree.find_split_in_direction(current_view, direction) {
             self.focus(id)
@@ -2318,11 +2336,15 @@ impl Editor {
     }
 
     pub fn swap_split_in_direction(&mut self, direction: tree::Direction) {
-        self.tree.swap_split_in_direction(direction);
+        if !self.ask_host_layout(tree::HostLayoutEvent::Swap(direction)) {
+            self.tree.swap_split_in_direction(direction);
+        }
     }
 
     pub fn transpose_view(&mut self) {
-        self.tree.transpose();
+        if !self.ask_host_layout(tree::HostLayoutEvent::Transpose) {
+            self.tree.transpose();
+        }
     }
 
     pub fn should_close(&self) -> bool {

@@ -218,7 +218,7 @@ impl EditorView {
         );
 
         // if we're not at the edge of the screen, draw a right border
-        if viewport.right() != view.area.right() {
+        if viewport.right() != view.area.right() && editor.tree.host.is_none() {
             let x = area.right();
             let border_style = theme.get("ui.window");
             for y in area.top()..area.bottom() {
