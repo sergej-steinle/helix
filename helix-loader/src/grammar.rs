@@ -70,8 +70,24 @@ pub fn get_language(name: &str) -> Result<Option<Grammar>> {
     unimplemented!()
 }
 
+/// Looks up a grammar linked into the binary by name (Helix's grammar name,
+/// e.g. `rust`, `markdown_inline`).
+pub type BuiltinGrammars = fn(&str) -> Option<Grammar>;
+
+static BUILTIN_GRAMMARS: std::sync::OnceLock<BuiltinGrammars> = std::sync::OnceLock::new();
+
+/// Registers the grammars linked into the binary. `get_language` consults
+/// them before `runtime/grammars/<name>.so`, so a statically linked build
+/// (which cannot `dlopen`) still highlights. The first registration wins.
+pub fn set_builtin_grammars(lookup: BuiltinGrammars) {
+    let _ = BUILTIN_GRAMMARS.set(lookup);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn get_language(name: &str) -> Result<Option<Grammar>> {
+    if let Some(grammar) = BUILTIN_GRAMMARS.get().and_then(|lookup| lookup(name)) {
+        return Ok(Some(grammar));
+    }
     let mut rel_library_path = PathBuf::new().join("grammars").join(name);
     rel_library_path.set_extension(DYLIB_EXTENSION);
     let library_path = crate::runtime_file(&rel_library_path);
